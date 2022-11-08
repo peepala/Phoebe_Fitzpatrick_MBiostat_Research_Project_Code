@@ -1,0 +1,732 @@
+######################################################################
+#	Script-file:	  ResearchProject.R
+#	Project:		    MBiostat 25 point Research Project
+
+#	Data used:	  	SMAC dataset
+#	Data created:	  
+#	Date:		      	7 November 2022
+#	Author: 	    	Phoebe Fitzpatrick 
+#
+# Purpose:  	  	Provide the commands to put on github
+######################################################################
+#clear if necessary 
+rm(list=ls())  
+
+#set directory to where data is found
+setwd("/XXXXXXXXXXXXX") 
+
+#load packages 
+pacman::p_load(tidyverse, ggplot2,Hmisc,haven, dplyr, psych, gamlss,  car, ggpubr, 
+               MASS, stringr)
+
+#load weight for age and hb for age datasets.... 
+#####################################################################################
+#LMS function used
+#FULL credit to authors who wrote this code which I tweaked slightly:
+#original code found here: https://rdrr.io/cran/gamlss/src/R/lms.R
+
+# Authors Mikis Stasinopoulos Bob Rigby and Vlasios Voudouris
+# created 11-04-12
+# upadated  8--6-14
+#-------------------------------------------------------------------------------
+#  the LMS familily of distributions
+LMS <- c("BCCGo","NO",  "BCPEo", "BCTo") #o stands for original
+# the SHASH
+theSHASH <-  c("NO", "SHASHo")
+#-------------------------------------------------------------------------------
+lms_w_GAIC <- function(y, x, n.cyc = 300, #usual n.cyc is 20
+                       families = LMS,
+                       data = NULL, 
+                       k=4, #higher penalty for the smoothness
+                       cent = c(0.4, 2, 10, 25, 50, 75, 90, 98, 99.6), 
+                       calibration = TRUE,
+                       trans.x = FALSE,
+                       fix.power = NULL,
+                       max.df = NULL,
+                       lim.trans = c(0, 1.5),   
+                       prof = FALSE,
+                       step = 0.1, 
+                       legend = FALSE,
+                       mu.df = NULL,
+                       sigma.df = NULL,
+                       nu.df = NULL,
+                       tau.df = NULL,
+                       c.crit = 0.01,
+                       method.pb = "GAIC",
+                       ... 
+)  
+{
+  #-------------------------------------------------------------------------------
+  # local function 
+  findPower <- function(y, x, data = NULL,  lim.trans = c(0, 1.5), prof=FALSE, k=2,  c.crit = 0.01, step=0.1)  
+  {
+    cat("*** Checking for transformation for x ***", "\n") 
+    ptrans<- function(x, p) if (abs(p)<=0.0001) log(x) else I(x^p)
+    fn <- function(p) GAIC(gamlss(y~pb(ptrans(x,p)), c.crit = c.crit, trace=FALSE), k=2)
+    if (prof) # profile dev
+    {
+      pp <- seq(lim.trans[1],lim.trans[2], step) 
+      pdev <- rep(0, length(pp)) 
+      for (i in 1:length(pp)) 
+      {
+        pdev[i] <- fn(pp[i])  
+        #   cat(pp[i], pdev[i], "\n")
+      }
+      plot(pdev~pp, type="l")
+      points(pdev~pp,col="blue")
+      par <- pp[which.min(pdev)]
+      cat('*** power parameters ', par,"***"," \n") 
+    } else
+    {
+      fn <- function(p) GAIC(gamlss(y~pb(ptrans(x,p)), c.crit = c.crit, trace=FALSE), k=2)
+      par <- optimise(fn, lower=lim.trans[1], upper=lim.trans[2])$minimum
+      cat('*** power parameters ', par,"***"," \n") 
+    }  
+    par
+  }
+  #-------------------------------------------------------------------------------
+  ptrans<- function(x, p) if (p==0) log(x) else I(x^p)
+  #-------------------------------------------------------------------------------
+  # end of local function
+  #-------------------------------------------------------------------------------
+  ## the families to fit
+  FAM <- families      
+  ## which method
+  method.pb <- match.arg(method.pb)
+  ## get the variables  
+  ylab <- deparse(substitute(y))
+  xlab <- deparse(substitute(x))
+  y <- if (!is.null(data)) get(deparse(substitute(y)), envir=as.environment(data)) else y
+  x <- if (!is.null(data)) get(deparse(substitute(x)), envir=as.environment(data)) else x
+  ## ----------------------------------------------------------------------------- 
+  ## if need to check for transformation in x    
+  if (is.null(fix.power))
+  {
+    if (trans.x) # if x^p
+    {
+      par <- findPower(y, x,   lim.trans = lim.trans, prof=prof, k=2,  c.crit = c.crit, step=0.1)    
+      ox <- x
+      x <-  ptrans(x,par)
+    } 
+  } else
+  { par <- fix.power
+  cat('*** power parameters fixed at ', par,"***"," \n")  
+  ox <- x
+  x <-  ptrans(x,par)
+  }
+  ##  starting  model for fitted values for mu (we assuming that this will work).
+  ##  Note no sigma is fitted here
+  ##  fit the model -------------------------------------------------------------- 
+  cat('*** Initial  fit***'," \n")   
+  switch(method.pb, 
+         "GAIC"= {m0 <- gamlss(y~pb(x, method="GAIC", k=k), sigma.formula=~1, data=data, c.crit = 0.01)}) ## initial fit  finish
+  
+  ## creating lists etc ----------------------------------------------------------
+  failed <- list() 
+  fits <- list()
+  aic <- AIC(m0, k=2)
+  fits <- c(fits, aic) 
+  whichdist <- 0
+  ## fitting the diferent models in FAM ------------------------------------------       
+  for (i in 1:length(FAM)) 
+  {
+    cat('*** Fitting', FAM[i], "***","\n")  
+    switch(method.pb, 
+           "GAIC"= { m1 <- try(gamlss(y ~ pb(x,  method="GAIC", k=k, df=mu.df, max.df = max.df),
+                                      sigma.formula = ~pb(x,  method="GAIC", k=k, df=sigma.df, max.df = max.df),
+                                      nu.formula = ~pb(x,  method="GAIC", k=k, df=nu.df, max.df = max.df), 
+                                      tau.formula = ~pb(x,  method="GAIC", k=k, df=nu.df, max.df = max.df), 
+                                      family = FAM[i], data = data, n.cyc = n.cyc,
+                                      ...), silent=TRUE)#  mu.start = fitted(m0), taken out 11-05-17 Mikis
+           })      
+    if (any(class(m1)%in%"try-error")) # if fitting failed
+    {
+      cat(FAM[i], " failed", "\n")
+      failed <- c(failed, FAM[i]) 
+    }
+    else
+    {
+      aic <- AIC(m1, k=2)
+      names(aic) <- FAM[i]
+      fits <- c(fits, aic)
+      if (AIC(m1, k=2) < AIC(m0, k=2)) 
+      {
+        m0 <-m1 
+        whichdist <- i
+      }
+    }
+  }
+  if(whichdist==0) 
+  { # refitting the Normal with sigma  if not of the models is any good
+    cat('*** Refitting', "NO", "***","\n")  
+    m0 <-  switch(method.pb, 
+                  "GAIC"= {m0 <- gamlss(y~pb(x, method="GAIC", k=k, max.df = max.df), 
+                                        sigma.formula=~pb(x, method="GAIC", k=k, max.df = max.df), 
+                                        data  =data, c.crit = 0.01, n.cyc = n.cyc)}) ## initial fit  finish
+  }
+  ## changing the call t look better in the output -------------------------------
+  m0$call$mu.start <- NULL # this works OK
+  m0$call$data <- substitute(data) # this is OK
+  m0$call$family <- if(whichdist==0) "NO" else FAM[whichdist] # this is OK
+  if (is.null(mu.df))    m0$call$formula <- formula(y~pb(x))
+  #m0$call$formula[[2]]  <- ylab
+  #m0$call$formula[[3]][[2]] <- xlab
+  if (is.null(sigma.df)) m0$call$sigma.formula <- formula(~pb(x))
+  
+  if (is.null(nu.df))    m0$call$nu.formula <- formula(~pb(x))
+  if (is.null(tau.df))   m0$call$tau.formula <- formula(~pb(x))
+  # convert to string
+  stringCall <- toString(deparse(m0$call))
+  stringCall <- gsub("x", xlab, stringCall)
+  stringCall <- gsub("y", ylab, stringCall)
+  # convert bact to call  
+  m0$call <- str2lang(stringCall)   
+  ## transformation needed -------------------------------------------------------        
+  if (trans.x||!is.null(fix.power))   
+  { 
+    x <- ox
+    m0$power <- par 
+  }
+  ## save the rest information ---------------------------------------------------       
+  m0$failed <- failed
+  fits <- unlist(fits)
+  m0$fits <- fits[order(fits)] 
+  m0$xvar <- x#with(DaTa,x)
+  m0$y <- y#with(DaTa,y)
+  m0$ylab <- ylab
+  m0$xlab <- xlab
+  if (!is.null(data)) m0$call$data  <- substitute(data)
+  ## calibration -----------------------------------------------------------------
+  if (calibration)
+  {
+    calibration(m0, xvar=x, cent=cent, pch = 15, cex = 0.5, col = gray(0.7), ylab=ylab, xlab=xlab, legend=legend)	
+  } 
+  else 
+  {
+    centiles(m0, xvar=x, cent=cent, pch = 15, cex = 0.5, 
+             col = gray(0.7), ylab=ylab, xlab=xlab, legend=legend)		
+  }
+  ## saving the fitted functions for mu sigma nu and tau  for prediction --------
+  if ("mu"%in%m0$par)
+  {
+    muFun <- splinefun(x, fitted(m0,"mu"), method="natural")
+    m0$muFun <- muFun
+  }
+  if ("sigma"%in%m0$par)
+  {
+    sigmaFun <- splinefun(x, fitted(m0,"sigma"), method="natural")
+    m0$sigmaFun <- sigmaFun
+  }
+  if ("nu"%in%m0$par)
+  {
+    nuFun <- splinefun(x, fitted(m0,"nu"), method="natural")
+    m0$nuFun <- nuFun
+  }
+  if ("tau"%in%m0$par)
+  {
+    tauFun <- splinefun(x, fitted(m0,"tau"), method="natural")
+    m0$tauFun <- tauFun
+  }
+  #------------------------------------------------------------------------------
+  class(m0) <- c("lms", class(m0))
+  m0  # save the last model
+}
+#-------------------------------------------------------------------------------
+########################################################################################
+#Sensitivity Analysis: Distributing the excess observations 
+
+#The following gives ideas for the methods of the data was redistributed...
+########################################################################################
+#weight redistributed uniformly
+########################################################################################
+#first get the weights that are whole numbers or end in .5 only from above 1kg and less
+#than or equal to 40kg because thats the only relevant range we need to be changing weights
+#of.
+#I am assuming more likely to be rounded DOWN, i.e 30kg 
+#more likely to be 30.1, 30.2 etc
+#and 35.6, 35.7, 35.9 more likely to be 35.5 instead of 36...
+
+#complete_weight_boy is the weight for age dataset I used in my project (male version), contains variables ID, AGE, WEIGHT, SEX
+
+#subset data where weight heaping occurs
+n_weight_boy<-complete_weight_boy %>% group_by(WEIGHT) %>% summarise(n_weight = n())
+n_weight_relevant_boy <- n_weight_boy %>%  filter(between(WEIGHT,1.1,40))
+
+n_weight_preferenced1_boy <- n_weight_relevant_boy %>% filter(WEIGHT%%1==0) %>% 
+  mutate(WEIGHT_ROUNDED = round(WEIGHT, digits=0))
+n_weight_preferenced2_boy <- n_weight_relevant_boy %>% filter(WEIGHT%%1==0.5)%>% 
+  mutate(WEIGHT_ROUNDED = floor(WEIGHT))
+n_weight_notpreferenced1_boy <- n_weight_relevant_boy %>%  filter(WEIGHT%%1!=0 & WEIGHT%%1<0.5) %>% 
+  mutate(WEIGHT_ROUNDED = round(WEIGHT, digits=0)) %>% group_by(WEIGHT_ROUNDED) %>%
+  slice_sample(n=1) %>% ungroup()
+n_weight_notpreferenced2_boy <- n_weight_relevant_boy %>%  filter(WEIGHT%%1!=0.5 & WEIGHT%%1>0.5) %>% 
+  mutate(WEIGHT_ROUNDED = floor(WEIGHT)) %>% group_by(WEIGHT_ROUNDED) %>%
+  slice_sample(n=1) %>% ungroup()
+
+#merge by rounded weight so we can calculate difference:
+n_weight_pref1_boy<-full_join(n_weight_preferenced1_boy,n_weight_notpreferenced1_boy, by="WEIGHT_ROUNDED")
+n_weight_pref1_boy<-n_weight_pref1_boy %>% mutate(excess = n_weight.x-n_weight.y) %>% 
+  mutate(excess = ifelse(excess<0 | is.na(excess), 0, excess)) %>% 
+  dplyr::select(WEIGHT=WEIGHT.x, excess) %>% filter(excess>0)
+n_weight_pref2_boy<-full_join(n_weight_preferenced2_boy,n_weight_notpreferenced2_boy, by="WEIGHT_ROUNDED")
+n_weight_pref2_boy<-n_weight_pref2_boy %>% mutate(excess = n_weight.x-n_weight.y) %>% 
+  mutate(excess = ifelse(excess<0 | is.na(excess), 0, excess)) %>% 
+  dplyr::select(WEIGHT=WEIGHT.x, excess)%>% filter(excess>0)
+
+#merge with larger dataset to put in loop: 
+to_sample_weight_boy1<-complete_weight_boy %>%  filter(between(WEIGHT,1.1,40) & WEIGHT%%1==0) %>% 
+  left_join(n_weight_pref1_boy) %>% filter(!is.na(excess))
+to_sample_weight_boy2<-complete_weight_boy %>%  filter(between(WEIGHT,1.1,40) & WEIGHT%%1==0.5) %>% 
+  left_join(n_weight_pref2_boy) %>% filter(!is.na(excess))
+to_sample_weight_boy<-rbind(to_sample_weight_boy1, to_sample_weight_boy2)
+
+#I want to take a random sample of size excess from to_sample_weight_boy1 or 2 and then change
+#their weights
+#if 0.0 then dist uniform from 0.1 to 0.4, if 0.5 then dist uniform from 0.6 to 0.9
+to_sample_weight_boy_unique<-to_sample_weight_boy %>% distinct(WEIGHT, .keep_all = T)
+
+my_weight_sampdf_boy<-data.frame()
+for (weight in to_sample_weight_boy_unique$WEIGHT){
+  #get number to sample 
+  excess<-to_sample_weight_boy_unique %>% filter(WEIGHT==weight) %>% pull(excess)
+  #sample at each weight
+  sampled<-to_sample_weight_boy %>% filter(WEIGHT==weight) %>% slice_sample(n=excess)
+  #change weights, if weight = 2 then change to 2.1 - 2.4 inclusive uniformly
+  uni_weight<-sampled %>% filter(WEIGHT==weight) %>% mutate(new_weight = runif(n=excess,
+                                                                               max=weight+0.4, #the higher weight range to be distributed to
+                                                                               min=weight+0.1)) #the lower weight range to be distributed to 
+  #round new weights to 1 d.p
+  uni_weight<-uni_weight %>% mutate(new_weight = round(new_weight, digits=1))
+  #put into dataframe
+  my_weight_sampdf_boy<-rbind(my_weight_sampdf_boy, uni_weight)
+}
+
+#merge datasets back to main dataset with the new weights
+SMAC_weight_boy_new_weight<-left_join(complete_weight_boy, my_weight_sampdf_boy, by=c("AGE", "WEIGHT", "id"))
+
+#create new weight by combining old and new weights
+SMAC_weight_boy_new_weight <- within(SMAC_weight_boy_new_weight, new_weight <- ifelse(is.na(new_weight), 
+                                                                                      WEIGHT,
+                                                                                      new_weight))
+##################################################################################################
+#weight redistributed based on probability 
+##################################################################################################
+new_weight_boydf<-data.frame()
+for (weight in to_sample_weight_boy_unique$WEIGHT){
+  #indexing
+  i<- weight
+  j<-weight+0.5
+  #get probability of being in range 0.1 to 0.4 above the 0.0 or 0.5 weight..
+  prob_boy<-n_weight_boy %>% filter(WEIGHT>i & WEIGHT<j) %>% 
+    mutate(p=n_weight/sum(n_weight)) %>% pull(p)
+  #change weights, if weight = 2 then change to 2.1 - 2.4 based on probability of being 
+  #in that range and if weight = 2.5 then change to 2.6-2.9 based on probability of being
+  #in that range...
+  allocation_boy<- rmultinom(n=1,
+                             size=to_sample_weight_boy_unique$excess[to_sample_weight_boy_unique$WEIGHT==weight], #size is the excess 
+                             prob_boy)
+  #sampling the number in allocation vector and changing their weight to new_weight
+  for (k in 1:length(allocation_boy)){
+    new_weight_boy<-complete_weight_boy %>% 
+      filter(WEIGHT==weight) %>% 
+      slice_sample(n=allocation_boy[k]+1) %>%
+      mutate(new_weight = case_when(allocation_boy[k] == 0 ~ WEIGHT,
+                                    TRUE ~ WEIGHT+k/10))
+    new_weight_boydf<-rbind(new_weight_boydf, new_weight_boy)
+  }
+}
+
+#merge dataset back to main dataset with the new weight
+SMAC_new_prob_weight_boy<-left_join(complete_weight_boy, new_weight_boydf, by=c("AGE", "WEIGHT", "id"))
+
+#create new weight by combining old and new weights
+SMAC_new_prob_weight_boy <- within(SMAC_new_prob_weight_boy, 
+                                   new_weight <- ifelse(is.na(new_weight), WEIGHT, new_weight))
+
+#######################################################################################
+#Age redistributions for HB data, uniformly redistributed
+#######################################################################################
+#uniformly distributing the excess observations 
+#first create id for the HB observations
+#full_HB is the HB for AGE dataset used in my project, contains variables id, HB, AGE 
+
+n_HB_age<-full_HB %>% group_by(AGE) %>% summarise(HB_count=n()) 
+
+#first get the ages divisible by 12 and the next month after that 
+#leaving out age=0 and age=1 as those seem precise 
+n_year_HB <- n_HB_age %>%  filter(AGE%%12==0 & AGE!=0)
+n_year_add_1_HB <- n_HB_age %>% mutate(AGE1=AGE%%12==0+1) %>% filter(AGE1==TRUE & AGE!=1)
+
+#then look at the difference in observations between the yearly age and 1 month after for the excess
+#which can be distributed into the other months..
+n_year_diff_HB<-n_year_HB
+n_year_diff_HB$HB_count_diff<-n_year_HB$HB_count-n_year_add_1_HB$HB_count
+HB_count_diff<-n_year_diff_HB$HB_count_diff
+
+#take a random sample of HB_count_diff observations at each corresponding age 
+#age 0 not included
+to_sample_HB<-full_HB %>% filter(AGE%%12==0) %>% left_join(n_year_diff_HB[c(1,3)])
+
+my_HB_sampdf<-data.frame()
+my_HB_samp<-c()
+
+for (age in n_year_diff_HB$AGE){
+  sampsize_HB=first(to_sample_HB$HB_count_diff[to_sample_HB$AGE==age])
+  sample_HB<-to_sample_HB %>% filter(AGE==age)
+  my_HB_samp <- sample_HB[sample(1:nrow(sample_HB),
+                                 size = sampsize_HB),]
+  my_HB_sampdf<-rbind(my_HB_sampdf, my_HB_samp)
+}
+
+#Now I have the sample which I can change the ages of to be distributed across the corresponding 
+#year, for every blue age except the last, there are 11 ages that are to be distributed across
+#the last age (144-150) only has 5 ages. 
+new_age_HB<-c()
+j<-12 #beginning at age 12 
+
+for (i in HB_count_diff[-12]) { #last age has smaller distribution range so is not included in loop
+  #range starts at age = 12 distributed between 23 and 13
+  k=k+1
+  uniform_HB<-purrr::rdunif(n=i,
+                            b=j+11, #the higher age range to be distributed to
+                            a=j) #the lower age range to be distributed to
+  
+  #the following replaces any of the biasedly preferenced values with other values that are 
+  #uniformly distributed so as not to increase these age observations
+  if (j<48) {
+    number_to_be_changed<-sum(uniform_HB==j+6)
+    uniform_HB<-replace(uniform_HB, uniform_HB==j+6, floor(sample(c(runif(number_to_be_changed, j,j+5),
+                                                                    runif(number_to_be_changed, j+7,j+11)),
+                                                                  number_to_be_changed)))
+    j<-j+12 #make j the next age in years, i.e 24 then 36, 48 etc
+    new_age_HB<-append(new_age_HB, uniform_HB)
+  } else {
+    j<-j+12 #make j the next age in years, i.e 24 then 36, 48 etc
+    new_age_HB<-append(new_age_HB, uniform_HB)
+  }
+}
+
+#for the final 6 ages (144-150)
+new_age_HB<-append(new_age_HB, purrr::rdunif(n=HB_count_diff[12],
+                                             b=144+6,
+                                             a=144))
+#append to sample_weight dataset
+my_HB_sampdf<-cbind(my_HB_sampdf, new_age_HB)
+
+#merge datasets back to main dataset with the new ages
+complete_HB_new_ages_uniform<-left_join(full_HB, my_HB_sampdf, by=c("AGE", "HB", "id"))
+
+#create new age by combining old and new ages
+complete_HB_new_ages_uniform <- within(complete_HB_new_ages_uniform, new_age_HB <- ifelse(is.na(new_age_HB), 
+                                                                                          AGE,
+                                                                                          new_age_HB))
+
+#######################################################################################
+#Age redistributions for HB data,  redistributed based on probability 
+#######################################################################################
+#initialise new_age dataframes for HB
+new_age_HBdf<-data.frame()
+
+for (i in n_year_diff_HB$AGE) { #for ages 12 to 144 
+  if (i<144) {
+    j <- i+12 #upper age limit
+    #probability of belonging to a particular age in the more specific months
+    prob_HB = n_HB_age %>% filter(AGE>i & AGE<j) %>% mutate(p=HB_count/sum(HB_count))
+    if (i==12 | i==24 | i==36) {
+      prob_HB = prob_HB %>% mutate(p = p+p[6]/10) %>% pull(p)
+      prob_HB[6] <- 0
+      #this makes sure no excess obs are distributed to 
+      #the prefentially biased half year ages and instead we just added to the non preferenced ages
+    } else {
+      prob_HB = prob_HB %>% pull(p)
+    } 
+    #allocate the ages that the excess observations for each precise year age will be put toward
+    allocation_HB<- rmultinom(n=1,
+                              size=n_year_diff_HB$HB_count_diff[n_year_diff_HB$AGE==i], #size is the excess 
+                              prob_HB)
+    #sampling the number in allocation vector and changing their age to new_age
+    for (k in 1:nrow(allocation_HB)){
+      new_age_HB<-full_HB %>% 
+        filter(AGE==i) %>% 
+        slice_sample(n=allocation_HB[k]+1) %>%
+        mutate(new_age_HB = ifelse(allocation_HB[k]==0, AGE, AGE+k))
+      new_age_HBdf<-rbind(new_age_HBdf, new_age_HB)
+    }
+  }
+  else {
+    j<-i+7 #upper age limit 
+    prob_HB = n_HB_age %>% filter(AGE>i & AGE<j) %>% mutate(p=HB_count/sum(HB_count)) %>% pull(p)
+    
+    allocation_HB<- rmultinom(n=1,
+                              size=n_year_diff_HB$HB_count_diff[n_year_diff_HB$AGE==i], #size is the excess 
+                              prob_HB)
+    #sampling the number in allocation vector and changing their age to new_age
+    for (k in 1:length(allocation_HB)){
+      new_age_HB<-full_HB %>% 
+        filter(AGE==i) %>% 
+        slice_sample(n=allocation_HB[k]) %>%
+        mutate(new_age_HB = ifelse(allocation_HB[k]==0, AGE, AGE+k))
+      new_age_HBdf<-rbind(new_age_HBdf, new_age_HB)
+    }
+  }
+}
+
+#merge dataset back to main dataset with the new ages
+HB_new_age_prob<-left_join(full_HB, new_age_HBdf, by=c("AGE", "HB", "id"))
+
+#create new age by combining old and new ages
+HB_new_age_prob <- within(HB_new_age_prob, new_age_HB <- ifelse(is.na(new_age_HB), AGE, new_age_HB))
+
+########################################################################################
+#LMS method 3 for WEIGHT split by sex  and HB
+########################################################################################
+#1) raw data 
+m_boy_raw<-lms_w_GAIC(WEIGHT,AGE,families=c("BCCG", "NO"), data=complete_weight_boy,
+                      k=4,calibration=F, trans.x=T)
+
+m_girl_raw<-lms_w_GAIC(WEIGHT,AGE,families=c("BCCG", "NO"),data=complete_weight_girl,
+                       k=4,calibration=F, trans.x=T,
+                       sigma.df = 5, mu.df=10) #manually setting EDFS 
+
+m_HB_raw<-lms_w_GAIC(HB,AGE, data=full_HB,families=c("NO", "BCCG"),
+                     k=4,calibration=F, trans.x=T)
+
+#put LMS parameters into dataframe 
+complete_weight_boy$M_lms<-m_boy_raw$mu.fv #M
+complete_weight_boy$S_lms<-m_boy_raw$sigma.fv #S
+complete_weight_boy$L_lms<-m_boy_raw$nu.fv #Lambda
+
+complete_weight_girl$M_lms<-m_girl_raw$mu.fv #M
+complete_weight_girl$S_lms<-m_girl_raw$sigma.fv #S
+complete_weight_girl$L_lms<-m_girl_raw$nu.fv #Lambda
+
+full_HB$M_lms<-m_HB_raw$mu.fv #M
+full_HB$S_lms<-m_HB_raw$sigma.fv #S
+full_HB$L_lms<-m_HB_raw$nu.fv #L
+
+#######################################################################################
+#Extra smoothing was sometimes required, and lms function was not decreasing the edfs as
+#much as I wanted, so this method was used to decrease specific LMS curves' edfs further
+#noting that there the LMS curves are not completely independent, but they basically are... 
+#######################################################################################
+#S for Hb RAW DATA is not properly smoothed very jaggedy
+Hbsmooth_raw<-predict(smooth.spline(x=full_HB$AGE,y=full_HB$S_lms, df = 20))
+HB_smoother_raw<-data.frame(AGE=Hbsmooth_raw$x, S_dfnew = Hbsmooth_raw$y)
+
+#replace S_lms in full_HB with new S in HB_smoother_raw df by merging
+full_HB<-full_HB %>% left_join(HB_smoother_raw, by="AGE") %>% 
+  dplyr::select(id, AGE,SEX, HB, M_lms, S_lms= S_dfnew, L_lms)
+
+#######################################################################################
+#Create clean LMS with age dataframes: for both weight and HB
+#then merge them together for a single weight and HB LMS parameter vs age dataframe
+#for use in virtual paediatric population creation
+#######################################################################################
+#1) raw data:
+weight_boy_raw_LMS_pre<-complete_weight_boy %>% mutate(Sex=1) %>%
+  dplyr::select(AGE, WEIGHT, Sex,SEX, M=M_lms, S=S_lms, L=L_lms) %>% group_by(AGE) %>% 
+  mutate(Q1 = quantile(WEIGHT, probs=0.01, na.rm=T),
+         Q99 = quantile(WEIGHT, probs=0.99, na.rm=T))
+
+weight_boy_raw_LMS<-weight_boy_raw_LMS_pre %>% distinct(AGE, .keep_all=T)
+
+#smooth percentiles to create upper and lower limits of sampling
+#2 was chosen so the higher age ranges didn't have the percentiles curving together, since sample
+#size is so small I dont think its correct, percentile curves should in theory fan away from
+#one another for weight
+boyweightsmoothQ1_1<- predict(smooth.spline(x=weight_boy_raw_LMS$AGE,y=weight_boy_raw_LMS$Q1, df = 2))
+boyweightsmoothQ99_1<- predict(smooth.spline(x=weight_boy_raw_LMS$AGE,y=weight_boy_raw_LMS$Q99, df = 2))
+boyweightsmoothdf<-data.frame(AGE=boyweightsmoothQ1_1$x, P1 = boyweightsmoothQ1_1$y,P99 = boyweightsmoothQ99_1$y)
+
+weight_girl_raw_LMS_pre<-complete_weight_girl %>% mutate(Sex=0) %>%
+  dplyr::select(AGE, WEIGHT, Sex,SEX,M=M_lms, S=S_lms, L=L_lms) %>% group_by(AGE) %>% 
+  mutate(Q1 = quantile(WEIGHT, probs=0.01, na.rm=T),
+         Q99 = quantile(WEIGHT, probs=0.99, na.rm=T)) 
+
+weight_girl_raw_LMS<-weight_girl_raw_LMS_pre %>% distinct(AGE, .keep_all=T)
+
+#smooth percentiles to create upper and lower limits of sampling
+girlweightsmoothQ1_1<- predict(smooth.spline(x=weight_girl_raw_LMS$AGE,y=weight_girl_raw_LMS$Q1, df = 5))
+girlweightsmoothQ99_1<- predict(smooth.spline(x=weight_girl_raw_LMS$AGE,y=weight_girl_raw_LMS$Q99, df = 5))
+girlweightsmoothdf<-data.frame(AGE=girlweightsmoothQ1_1$x, P1 = girlweightsmoothQ1_1$y,P99 = girlweightsmoothQ99_1$y)
+
+#merge back to other dataframe
+weight_girl_raw_LMS<-weight_girl_raw_LMS %>% left_join(girlweightsmoothdf) %>% 
+  dplyr::select(AGE, Sex,SEX, M, S, L, P1, P99)
+weight_boy_raw_LMS<-weight_boy_raw_LMS %>% left_join(boyweightsmoothdf) %>% 
+  dplyr::select(AGE, Sex,SEX, M, S, L, P1, P99)
+
+#calculate 1st and 99th percengtiles by age
+full_HB_lms_pre<-full_HB %>% dplyr::select(AGE, HB, HBM=M_lms, HBS=S_lms, HBL = L_lms) %>% 
+  group_by(AGE) %>% mutate(Q1 = quantile(HB, probs=0.01, na.rm=T),
+                           Q99 = quantile(HB, probs=0.99, na.rm=T))
+
+full_HB_lms<-full_HB_lms_pre %>% distinct(AGE, .keep_all=T)
+
+#smooth percentiles to create upper and lower limits of sampling
+HBsmoothQ1_1<- predict(smooth.spline(x=full_HB_lms$AGE,y=full_HB_lms$Q1, df = 3))
+HBsmoothQ99_1<- predict(smooth.spline(x=full_HB_lms$AGE,y=full_HB_lms$Q99, df = 3))
+HBsmoothdf<-data.frame(AGE=HBsmoothQ1_1$x, HBP1 = HBsmoothQ1_1$y, HBP99 = HBsmoothQ99_1$y)
+
+HB_raw_LMS<-full_HB_lms %>% left_join(HBsmoothdf) %>% 
+  dplyr::select(AGE, HBM, HBS, HBL, HBP1, HBP99)
+
+#merge:
+raw_combined_LMS_weight<-rbind(weight_boy_raw_LMS, weight_girl_raw_LMS)
+raw_combined_LMS<-left_join(raw_combined_LMS_weight,HB_raw_LMS,by="AGE")
+
+#######################################################################################
+# create virtual populations
+#######################################################################################
+# Function to sample weight and HB given the LMS parameters
+# n  is the required sample size per age
+# P1 and P99 are the outer limits (data driven) of the sample, anything outside these limits
+#wont enter the population
+
+#FULL CREDIT TO Kitabi and colleagues who wrote this function: 
+#Kitabi E, Bensman TJ, Earp JC, Chilukuri DM, Smith H, Ball L, O'Shaughnessy 
+#E, Yasinskaya Y, Colangelo PM, Reynolds KS. Effect of Body Weight and 
+#Age on the Pharmacokinetics of Dihydroartemisinin: Food and Drug Administration 
+#Basis for Dose Determination of Artesunate for Injection in Pediatric Patients 
+#With Severe Malaria. Clin Infect Dis. 2021 Sep 7;73(5):903-906.
+#doi: 10.1093/cid/ciab149. PMID: 33605994.
+
+sample_wtnhb<-function(Age, Sex, M, L, S, P1, P99, HBM, HBS,HBL, HBP1, HBP99, n, ...){
+  sd   <- abs(ifelse(L==0, S, M^L*L*S)) #sd for weight
+  HBsd <- abs(ifelse(HBL==0, HBS, HBM^HBL*HBL*HBS))  #sd for hb
+  
+  mean   <- ifelse(L==0, log(M), M^L) #mean for weight
+  HBmean <- ifelse(HBL==0, log(HBM), HBM^HBL)  #mean for hb
+  
+  zscore_P99 <- ifelse(L==0, ln(P99/M)/S, (P99^L-M^L)/(S*L*M^L))
+  zscore_P1 <- ifelse(L==0, ln(P1/M)/S, (P1^L-M^L)/(S*L*M^L))
+  HBzscore_P99 <- ifelse(HBL==0, ln(HBP99/HBM)/HBS, (HBP99^HBL-HBM^HBL)/(HBS*HBL*HBM^HBL))
+  HBzscore_P1 <- ifelse(HBL==0, ln(HBP1/HBM)/HBS, (HBP1^HBL-HBM^HBL)/(HBS*HBL*HBM^HBL))
+  
+  wthb   <- MASS::mvrnorm(n=n*1e2, 
+                          mu=c(mean, HBmean), 
+                          Sigma = matrix(c(sd^2, 0, 0, HBsd^2), nrow = 2, ncol = 2)) %>% as.data.frame(.)
+  #mvrnorm produces samples from the specified multivariate normal dist from the MASS package 
+  #produces n*100 samples with means being the mean of weight and mean of hb 
+  #Sigma covar matrix with variances for weight and hb in diagonal 
+  x      <- wthb[,1] #gets weight 
+  HBx    <- wthb[,2] #gets hb 
+  
+  zscore   = (x-mean)/sd #defn of Z-score for weight 
+  HBzscore = (HBx-HBmean)/HBsd #defn of Z-score for hb 
+  
+  zscore    <- zscore[zscore > zscore_P1 & zscore < zscore_P99] #keeps z-scores that are between 1 and 99 percentile from data 
+  HBzscore  <- HBzscore[HBzscore > HBzscore_P1 & HBzscore < HBzscore_P99]
+  
+  zscore    <- sample(zscore, size = n, replace = TRUE) 
+  HBzscore  <- sample(HBzscore, size = n, replace = TRUE)
+  #gets random sample of zscore of size n with replacement , replacement incase we need to sample a sample
+  #larger than the number of zscores
+  
+  if(L==0) {wt = M*exp(S*zscore)} else {wt = M*(1+L*S*zscore)^(1/L)}
+  if(HBL==0) {hb = HBM*exp(HBS*HBzscore)} else {hb = HBM*(1+HBL*HBS*HBzscore)^(1/HBL)}
+  
+  df <- data.frame(Age=Age, Sex=Sex, M=M, L=L, S=S, P1=P1, P99=P99, HBM=HBM,
+                   HBS=HBS, HBP1=HBP1,HBL=HBL, HBP99=HBP99, WT=wt, HB=hb)
+  return(df)
+}
+
+#######################################################################################
+#creating virtual paediatric population with weights and hb
+#under the different data redistributions:
+#######################################################################################
+#1. raw 
+raw_no_bin_virtual<-raw_combined_LMS %>% 
+  dplyr::select(Age=AGE, Sex, L, M, S, P1, P99, HBM, HBS,HBL, HBP1, HBP99) %>% 
+  pmap_dfr(.f=sample_wtnhb, n=30000)
+
+#######################################################################################
+#adding in temperature for the complete hb, weight and temp dataset:
+#then taking 1000 rows per rounded weight randomly for simulating AUC: 
+#######################################################################################
+## Pediatric temperatures from plos medicine paper, peter kres group, 
+#keep below 41 and above 35 
+temperature <- rnorm(n=10000000, mean = 38.2, sd = 1.2) 
+
+#I am restricting to 40kg as anything more isn't really needed:
+#Only looking at weights were there are 1000+ samples in the group , 
+#otherwise they are probably not super precise
+
+#1. raw 
+Raw_no_bin_paed <- raw_no_bin_virtual  %>% 
+  mutate(TEMP = sample(x= temperature[between(temperature, 35, 41)], size=n()),
+         SEX = ifelse(Sex==1, "M", "F"),
+         rounded_weight = round(WT, digits=0)) %>% filter(between(rounded_weight,3,40)) %>% 
+  group_by(rounded_weight) %>% slice_sample(n=1000) %>%
+  ungroup()
+
+#######################################################################################
+#Part 2 
+#######################################################################################
+#Simulated total first-dose exposure levels (AUC0–12h) of DHA after:
+
+#the standard 2.4 mg/kg dosing in children at different body weights and 
+#the WHO endorsed dose (3 mg/kg <20 kg or 2.4 mg/kg)
+#######################################################################################
+#from zaloumis from 223 patients (i.v ARS only)
+CL_F <- 12.9   #population mean clearance
+V_Fpop = 11.66 #population mean volume
+beta_hb <- -0.04  
+med_hb <- 8.8 
+beta_temp <- 0.07 
+med_temp <- 38.2
+median_weight <- 15 
+beta_sex<- -0.15 
+k_mat <- 0.082 #age maturation thingo 
+omega_Cl=0.55
+omega_V=0.42
+rho_ClV=0.6
+omega_ClV= rho_ClV*sqrt(omega_Cl^2*omega_V^2)
+
+Sigma <- matrix(c(omega_Cl^2,omega_ClV, omega_ClV ,omega_V^2), 
+                nrow=2, byrow=TRUE) 
+
+ita <- MASS::mvrnorm(n=nrow(Raw_no_bin_paed), mu=c(0,0),
+                     Sigma = Sigma) 
+#######################################################################################
+#1. raw AUC 
+######################################################################################
+#calculate rounded weight for dose calculation and then the 2 dosage types:
+#dose1 is the weight independent dosing FDA endorses
+#dose2 is the weight based dosing WHO endorses
+
+Raw_no_bin_paed_AUC1<- Raw_no_bin_paed %>% mutate(dose = 2.4*rounded_weight,
+                                                  dose_type = "FDA endorsed dosing")
+Raw_no_bin_paed_AUC2<- Raw_no_bin_paed %>% mutate(dose = case_when(rounded_weight<20 ~ 3*rounded_weight,
+                                                                   TRUE ~ 2.4*rounded_weight),
+                                                  dose_type = "WHO endorsed dosing")
+
+
+Raw_no_bin_paed_AUC_comp1 <- rbind(Raw_no_bin_paed_AUC1, Raw_no_bin_paed_AUC2) %>% 
+  dplyr::select(Age, Sex, WT, HB, TEMP, rounded_weight, dose, dose_type)
+
+#calculate CL_Fpop:
+Raw_no_bin_paed_AUC_comp1<- Raw_no_bin_paed_AUC_comp1 %>% mutate(CL_Fpop = CL_F * 
+                                                                   (1+beta_hb*(HB-med_hb))* #hb covariate
+                                                                   (1+beta_temp*(TEMP-med_temp))* #temp covariate
+                                                                   (1+beta_sex*(Sex))) #sex covariate, male=1 female =0
+
+#calculate individual clearance (CL_Fi)
+Raw_no_bin_paed_AUC_comp1<- Raw_no_bin_paed_AUC_comp1 %>%
+  mutate(CL_Fi = ((CL_Fpop/3.1)*((WT/median_weight)^0.75)*exp(-k_mat*Age)+
+                    CL_Fpop*((WT/median_weight)^0.75)*(1-exp(-k_mat*Age)))*exp(ita[,1]))
+
+#calculate individual volume (V_fi)
+Raw_no_bin_paed_AUC_comp1<- Raw_no_bin_paed_AUC_comp1 %>% mutate(V_fi = V_Fpop * (WT/median_weight)*exp(ita[,2]))
+
+#calculate drug exposure DHA: *1000 is to convert from hr*mg/L to hr*ng/mL to match forest plots in papers
+Raw_no_bin_paed_AUC_comp1<- Raw_no_bin_paed_AUC_comp1 %>% 
+  mutate(AUC_dose = (dose*(284/384)/CL_Fi)*(1-exp(-12*(CL_Fi/V_fi)))*1000) 
+#times dose by (284/384) to account for 
+#change in molecular weight between artesunate and DHA, asssumes 100% converison 
+
+Raw_no_bin_paed_AUC_comp1<-Raw_no_bin_paed_AUC_comp1 %>% group_by(rounded_weight, dose_type) %>% 
+  mutate(AUC_med_dose = median(AUC_dose),
+         AUC_25_dose = quantile(AUC_dose, probs=0.25, na.rm=T),
+         AUC_75_dose = quantile(AUC_dose, probs=0.75,na.rm=T))
+######################################################################################
